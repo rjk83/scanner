@@ -14,13 +14,13 @@ import plotly.graph_objects as go
 import plotly.express as px
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Network constants  (Bybit Linear Perpetuals — no geo-restriction)
+# Network constants  (OKX — cloud-friendly, no datacenter IP blocks)
 # ─────────────────────────────────────────────────────────────────────────────
-BASE         = "https://api.bybit.com"
-LOOKBACK_30M = 500    # Bybit max 1000; 500 × 30m ≈ 10 days of history
+BASE         = "https://www.okx.com"
+LOOKBACK_30M = 300    # OKX max 300 per request; 300 × 30m = 6.25 days, plenty for avg vol
 
-# Bybit interval strings differ from Binance
-INTERVAL_MAP = {"30m": "30", "5m": "5", "15m": "15", "1h": "60"}
+# OKX interval strings
+OKX_INTERVALS = {"30m": "30m", "5m": "5m", "15m": "15m", "1h": "1H"}
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Default configuration
@@ -223,19 +223,19 @@ def safe_get(url, params=None, _retries=4):
         try:
             r = get_session().get(url, params=params, timeout=20)
             if r.status_code == 429:
-                time.sleep(int(r.headers.get("Retry-After", 10))); continue
-            if r.status_code == 418:
-                time.sleep(60 * (attempt + 1)); continue
-            if r.status_code == 451:
+                time.sleep(int(r.headers.get("Retry-After", 60))); continue
+            if r.status_code in (418, 403, 451):
+                # 403/451 = datacenter IP blocked by exchange
+                # If OKX also returns these, switch hosting to Railway/Fly.io
                 raise RuntimeError(
-                    "HTTP 451: This server's IP is geo-blocked by the exchange. "
-                    "Bybit should not return 451 — check BASE URL or network."
+                    f"HTTP {r.status_code}: Exchange is blocking this server's IP. "
+                    "Deploy on Railway (railway.app) instead — uses non-datacenter IPs."
                 )
             r.raise_for_status()
             data = r.json()
-            # Bybit wraps results: retCode 0 = success
-            if isinstance(data, dict) and "retCode" in data and data["retCode"] != 0:
-                raise RuntimeError(f"Bybit API error {data['retCode']}: {data.get('retMsg', '')}")
+            # OKX wraps results: code "0" (string) = success
+            if isinstance(data, dict) and "code" in data and data["code"] != "0":
+                raise RuntimeError(f"OKX API error {data['code']}: {data.get('msg', '')}")
             return data
         except requests.exceptions.ConnectionError:
             if attempt < _retries - 1: time.sleep(5); continue
@@ -243,46 +243,61 @@ def safe_get(url, params=None, _retries=4):
     raise RuntimeError(f"Failed after {_retries} retries: {url}")
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Bybit data
+# OKX data helpers
 # ─────────────────────────────────────────────────────────────────────────────
+def _to_okx(sym: str) -> str:
+    """BTCUSDT  →  BTC-USDT-SWAP"""
+    return f"{sym[:-4]}-USDT-SWAP" if sym.endswith("USDT") else sym
+
+def _from_okx(inst_id: str) -> str:
+    """BTC-USDT-SWAP  →  BTCUSDT"""
+    return inst_id.replace("-USDT-SWAP", "USDT") if inst_id.endswith("-USDT-SWAP") else inst_id
+
 def get_symbols(watchlist: list) -> list:
-    """Return watchlist symbols that are active linear perpetuals on Bybit."""
+    """Return watchlist symbols that are live USDT linear perps on OKX."""
     active = set()
-    cursor = None
-    for _ in range(10):   # safety: max 10 pages
-        params = {"category": "linear", "limit": 1000}
-        if cursor:
-            params["cursor"] = cursor
-        data   = safe_get(f"{BASE}/v5/market/instruments-info", params)
-        result = data.get("result", {})
-        for s in result.get("list", []):
-            if (s.get("status") == "Trading"
-                    and s.get("quoteCoin") == "USDT"
-                    and s.get("contractType") == "LinearPerpetual"):
-                active.add(s["symbol"])
-        cursor = result.get("nextPageCursor", "")
-        if not cursor:
-            break
+    data   = safe_get(f"{BASE}/api/v5/public/instruments", {"instType": "SWAP"})
+    for s in data.get("data", []):
+        inst_id = s.get("instId", "")
+        if inst_id.endswith("-USDT-SWAP") and s.get("state") == "live":
+            active.add(_from_okx(inst_id))
     skipped = len([s for s in watchlist if s not in active])
     if skipped:
-        print(f"  [{skipped} watchlist symbol(s) not trading on Bybit — skipped]")
+        print(f"  [{skipped} watchlist symbol(s) not trading on OKX — skipped]")
     return [s for s in watchlist if s in active]
 
-def get_klines(sym, interval, limit):
-    """Fetch OHLCV candles from Bybit (returns ascending time order)."""
-    bybit_iv = INTERVAL_MAP.get(interval, interval)
-    data  = safe_get(f"{BASE}/v5/market/kline",
-                     {"category": "linear", "symbol": sym,
-                      "interval": bybit_iv, "limit": min(limit, 1000)})
-    # Bybit returns newest-first; reverse to oldest-first (same as Binance)
-    bars = data["result"]["list"][::-1]
+def get_klines(sym: str, interval: str, limit: int) -> list:
+    """Fetch OHLCV candles from OKX in ascending time order.
+    OKX max = 300 per request, so we paginate when limit > 300.
+    """
+    okx_iv  = OKX_INTERVALS.get(interval, interval)
+    inst_id = _to_okx(sym)
+    all_bars: list = []
+    after = None          # OKX 'after' = fetch bars OLDER than this ts
+
+    while len(all_bars) < limit:
+        batch  = min(300, limit - len(all_bars))
+        params = {"instId": inst_id, "bar": okx_iv, "limit": batch}
+        if after:
+            params["after"] = after
+        data = safe_get(f"{BASE}/api/v5/market/candles", params)
+        bars = data.get("data", [])
+        if not bars:
+            break
+        all_bars.extend(bars)
+        after = bars[-1][0]          # oldest timestamp in this batch → page backwards
+        if len(bars) < batch:
+            break
+
+    # OKX returns newest-first; reverse to oldest-first
+    all_bars.reverse()
     return [{"time":   int(b[0]),
              "open":   float(b[1]),
              "high":   float(b[2]),
              "low":    float(b[3]),
              "close":  float(b[4]),
              "volume": float(b[5])}
-            for b in bars]
+            for b in all_bars]
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Technical helpers
@@ -529,7 +544,7 @@ def _ensure_scanner():
 # ─────────────────────────────────────────────────────────────────────────────
 # ─────────────────────────────────────────────────────────────────────────────
 st.set_page_config(
-    page_title="Bybit Futures Scanner",
+    page_title="OKX Futures Scanner",
     page_icon="🔍",
     layout="wide",
     initial_sidebar_state="expanded",
@@ -674,7 +689,7 @@ with st.sidebar:
 # ─────────────────────────────────────────────────────────────────────────────
 
 # ── Header ────────────────────────────────────────────────────────────────────
-st.title("🔍 Bybit Futures Scanner")
+st.title("🔍 OKX Futures Scanner")
 
 last_scan = health.get("last_scan_at", "never")
 if last_scan and last_scan != "never":
