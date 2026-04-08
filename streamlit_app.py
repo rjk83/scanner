@@ -14,10 +14,13 @@ import plotly.graph_objects as go
 import plotly.express as px
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Network constants
+# Network constants  (Bybit Linear Perpetuals — no geo-restriction)
 # ─────────────────────────────────────────────────────────────────────────────
-BASE         = "https://fapi.binance.com"
-LOOKBACK_30M = 1441   # 30 days × 48 bars + 1 forming bar
+BASE         = "https://api.bybit.com"
+LOOKBACK_30M = 500    # Bybit max 1000; 500 × 30m ≈ 10 days of history
+
+# Bybit interval strings differ from Binance
+INTERVAL_MAP = {"30m": "30", "5m": "5", "15m": "15", "1h": "60"}
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Default configuration
@@ -223,29 +226,63 @@ def safe_get(url, params=None, _retries=4):
                 time.sleep(int(r.headers.get("Retry-After", 10))); continue
             if r.status_code == 418:
                 time.sleep(60 * (attempt + 1)); continue
+            if r.status_code == 451:
+                raise RuntimeError(
+                    "HTTP 451: This server's IP is geo-blocked by the exchange. "
+                    "Bybit should not return 451 — check BASE URL or network."
+                )
             r.raise_for_status()
-            return r.json()
+            data = r.json()
+            # Bybit wraps results: retCode 0 = success
+            if isinstance(data, dict) and "retCode" in data and data["retCode"] != 0:
+                raise RuntimeError(f"Bybit API error {data['retCode']}: {data.get('retMsg', '')}")
+            return data
         except requests.exceptions.ConnectionError:
             if attempt < _retries - 1: time.sleep(5); continue
             raise
     raise RuntimeError(f"Failed after {_retries} retries: {url}")
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Binance data
+# Bybit data
 # ─────────────────────────────────────────────────────────────────────────────
 def get_symbols(watchlist: list) -> list:
-    data   = safe_get(f"{BASE}/fapi/v1/exchangeInfo")
-    active = {s["symbol"] for s in data["symbols"]
-              if s["contractType"] == "PERPETUAL" and s["quoteAsset"] == "USDT"
-              and s["status"] == "TRADING"}
+    """Return watchlist symbols that are active linear perpetuals on Bybit."""
+    active = set()
+    cursor = None
+    for _ in range(10):   # safety: max 10 pages
+        params = {"category": "linear", "limit": 1000}
+        if cursor:
+            params["cursor"] = cursor
+        data   = safe_get(f"{BASE}/v5/market/instruments-info", params)
+        result = data.get("result", {})
+        for s in result.get("list", []):
+            if (s.get("status") == "Trading"
+                    and s.get("quoteCoin") == "USDT"
+                    and s.get("contractType") == "LinearPerpetual"):
+                active.add(s["symbol"])
+        cursor = result.get("nextPageCursor", "")
+        if not cursor:
+            break
+    skipped = len([s for s in watchlist if s not in active])
+    if skipped:
+        print(f"  [{skipped} watchlist symbol(s) not trading on Bybit — skipped]")
     return [s for s in watchlist if s in active]
 
 def get_klines(sym, interval, limit):
-    data = safe_get(f"{BASE}/fapi/v1/klines",
-                    {"symbol": sym, "interval": interval, "limit": limit})
-    return [{"time": int(k[0]), "open": float(k[1]), "high": float(k[2]),
-             "low": float(k[3]), "close": float(k[4]), "volume": float(k[5])}
-            for k in data]
+    """Fetch OHLCV candles from Bybit (returns ascending time order)."""
+    bybit_iv = INTERVAL_MAP.get(interval, interval)
+    data  = safe_get(f"{BASE}/v5/market/kline",
+                     {"category": "linear", "symbol": sym,
+                      "interval": bybit_iv, "limit": min(limit, 1000)})
+    # Bybit returns newest-first; reverse to oldest-first (same as Binance)
+    bars = data["result"]["list"][::-1]
+    return [{"time":   int(b[0]),
+             "open":   float(b[1]),
+             "high":   float(b[2]),
+             "low":    float(b[3]),
+             "close":  float(b[4]),
+             "volume": float(b[5])}
+            for b in bars]
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Technical helpers
@@ -492,7 +529,7 @@ def _ensure_scanner():
 # ─────────────────────────────────────────────────────────────────────────────
 # ─────────────────────────────────────────────────────────────────────────────
 st.set_page_config(
-    page_title="Binance Futures Scanner",
+    page_title="Bybit Futures Scanner",
     page_icon="🔍",
     layout="wide",
     initial_sidebar_state="expanded",
@@ -637,7 +674,7 @@ with st.sidebar:
 # ─────────────────────────────────────────────────────────────────────────────
 
 # ── Header ────────────────────────────────────────────────────────────────────
-st.title("🔍 Binance Futures Scanner")
+st.title("🔍 Bybit Futures Scanner")
 
 last_scan = health.get("last_scan_at", "never")
 if last_scan and last_scan != "never":
