@@ -40,6 +40,9 @@ DEFAULT_CONFIG: dict = {
     "rsi_1h_max":         72,
     "loop_minutes":       3,
     "cooldown_minutes":   30,
+    "use_ema200":         True,
+    "ema_period":         200,
+    "use_sar":            True,
     "watchlist": [
         "PTBUSDT","SANTOSUSDT","XRPUSDT","HEMIUSDT","OGUSDT","SIRENUSDT",
         "BANUSDT","BASUSDT","4USDT","MAGMAUSDT","XANUSDT","TRIAUSDT",
@@ -560,15 +563,17 @@ def process(sym, cfg: dict, path_b_vol: float, rsi_max: float):
             with _filter_lock: _filter_counts["f7_rsi1h"] = _filter_counts.get("f7_rsi1h", 0) + 1
             return None
 
-        # ── F8 — EMA 200 filter (price must be above EMA 200 on 5m AND 15m) ──
+        # ── F8 — EMA filter (price must be above EMA on 5m AND 15m) ─────────
         closes_5m  = [c["close"] for c in m5]
         closes_15m = [c["close"] for c in m15]
-        ema200_5m  = calc_ema(closes_5m,  200)
-        ema200_15m = calc_ema(closes_15m, 200)
-        if (not ema200_5m  or entry < ema200_5m[-1] or
-                not ema200_15m or entry < ema200_15m[-1]):
-            with _filter_lock: _filter_counts["f8_ema200"] = _filter_counts.get("f8_ema200", 0) + 1
-            return None
+        if cfg.get("use_ema200", True):
+            ema_p      = max(2, int(cfg.get("ema_period", 200)))
+            ema_5m     = calc_ema(closes_5m,  ema_p)
+            ema_15m    = calc_ema(closes_15m, ema_p)
+            if (not ema_5m  or entry < ema_5m[-1] or
+                    not ema_15m or entry < ema_15m[-1]):
+                with _filter_lock: _filter_counts["f8_ema200"] = _filter_counts.get("f8_ema200", 0) + 1
+                return None
 
         # ── F9 — MACD bullish crossover filter (3m, 5m, 15m) ─────────────────
         # Conditions per timeframe:
@@ -586,12 +591,13 @@ def process(sym, cfg: dict, path_b_vol: float, rsi_max: float):
 
         # ── F10 — Parabolic SAR bullish (5m AND 15m) ─────────────────────────
         # SAR must be below the current price on both timeframes
-        sar_5m  = calc_parabolic_sar(m5)
-        sar_15m = calc_parabolic_sar(m15)
-        if (not sar_5m  or not sar_5m[-1][1] or
-                not sar_15m or not sar_15m[-1][1]):
-            with _filter_lock: _filter_counts["f10_sar"] = _filter_counts.get("f10_sar", 0) + 1
-            return None
+        if cfg.get("use_sar", True):
+            sar_5m  = calc_parabolic_sar(m5)
+            sar_15m = calc_parabolic_sar(m15)
+            if (not sar_5m  or not sar_5m[-1][1] or
+                    not sar_15m or not sar_15m[-1][1]):
+                with _filter_lock: _filter_counts["f10_sar"] = _filter_counts.get("f10_sar", 0) + 1
+                return None
 
         tp  = round(entry * (1 + cfg["tp_pct"] / 100), 6)
         sl  = round(entry * (1 - cfg["sl_pct"] / 100), 6)
@@ -796,6 +802,38 @@ with st.sidebar:
 
     st.divider()
 
+    # ── EMA Filter ────────────────────────────────────────────────────────────
+    st.markdown("**📉 F8 — EMA Filter (5m & 15m)**")
+    new_use_ema200 = st.checkbox(
+        "Enable EMA filter",
+        value=bool(_snap_cfg.get("use_ema200", True)),
+        key="cfg_use_ema200",
+        help="Price must be above the selected EMA on both 5m and 15m charts.",
+    )
+    new_ema_period = st.number_input(
+        "EMA period",
+        min_value=2,
+        max_value=500,
+        step=1,
+        value=int(_snap_cfg.get("ema_period", 200)),
+        key="cfg_ema_period",
+        disabled=not new_use_ema200,
+        help="Set any EMA period (e.g. 50, 100, 200). Default: 200.",
+    )
+
+    st.divider()
+
+    # ── Parabolic SAR Filter ──────────────────────────────────────────────────
+    st.markdown("**🪂 F10 — Parabolic SAR (5m & 15m)**")
+    new_use_sar = st.checkbox(
+        "Enable Parabolic SAR filter",
+        value=bool(_snap_cfg.get("use_sar", True)),
+        key="cfg_use_sar",
+        help="SAR must signal a bullish trend (SAR below price) on both 5m and 15m.",
+    )
+
+    st.divider()
+
     # ── Execution ─────────────────────────────────────────────────────────────
     st.markdown("**⏱ Execution**")
     c5, c6 = st.columns(2)
@@ -885,6 +923,9 @@ with st.sidebar:
             "rsi_1h_max":         int(new_rsi1h_max),
             "loop_minutes":       int(new_loop),
             "cooldown_minutes":   int(new_cool),
+            "use_ema200":         bool(new_use_ema200),
+            "ema_period":         int(new_ema_period),
+            "use_sar":            bool(new_use_sar),
             "watchlist":          new_wl,
         }
         with _config_lock:
@@ -1114,9 +1155,9 @@ if fc.get("checked", 0) > 0:
             ("After F5 5m Res.",  after_f5),
             ("After F6 15m Res.", after_f6),
             ("After F7 1h RSI",   after_f7),
-            ("After F8 EMA 200",  after_f8),
+            (f"After F8 EMA {_snap_cfg.get('ema_period', 200)}" + (" ✓" if _snap_cfg.get("use_ema200", True) else " (off)"), after_f8),
             ("After F9 MACD",     after_f9),
-            ("Passed F10 SAR",    fc.get("passed", 0)),
+            ("Passed F10 SAR" + (" ✓" if _snap_cfg.get("use_sar", True) else " (off)"), fc.get("passed", 0)),
         ]
         fig_funnel = go.Figure(go.Funnel(
             y=[d[0] for d in funnel_data],
