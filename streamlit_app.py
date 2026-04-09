@@ -657,6 +657,55 @@ with st.sidebar:
 
     st.divider()
 
+    # ── Data management ───────────────────────────────────────────────────────
+    st.markdown("**🗑 Clear Signal History**")
+
+    if st.button("⚡ Flush All Data", use_container_width=True, type="secondary",
+                 help="Remove every signal from history and reset health counters"):
+        with _log_lock:
+            _b._bsc_log["signals"] = []
+            _b._bsc_log["health"] = {
+                "total_cycles": 0, "last_scan_at": None,
+                "last_scan_duration_s": 0.0, "total_api_errors": 0,
+                "watchlist_size": 0, "btc_regime": "—", "btc_rsi": 0.0,
+            }
+            save_log(_b._bsc_log)
+        st.success("✅ All data flushed")
+        st.rerun()
+
+    c_day, c_week = st.columns(2)
+    if c_day.button("📅 Clear 24h", use_container_width=True,
+                    help="Remove signals from the last 24 hours"):
+        cutoff = datetime.now(timezone.utc) - timedelta(hours=24)
+        with _log_lock:
+            before = len(_b._bsc_log["signals"])
+            _b._bsc_log["signals"] = [
+                s for s in _b._bsc_log["signals"]
+                if datetime.fromisoformat(
+                    s["timestamp"].replace("Z", "+00:00")) < cutoff
+            ]
+            removed = before - len(_b._bsc_log["signals"])
+            save_log(_b._bsc_log)
+        st.success(f"✅ Removed {removed} signal(s) from last 24 h")
+        st.rerun()
+
+    if c_week.button("📆 Clear 7d", use_container_width=True,
+                     help="Remove signals from the last 7 days"):
+        cutoff = datetime.now(timezone.utc) - timedelta(days=7)
+        with _log_lock:
+            before = len(_b._bsc_log["signals"])
+            _b._bsc_log["signals"] = [
+                s for s in _b._bsc_log["signals"]
+                if datetime.fromisoformat(
+                    s["timestamp"].replace("Z", "+00:00")) < cutoff
+            ]
+            removed = before - len(_b._bsc_log["signals"])
+            save_log(_b._bsc_log)
+        st.success(f"✅ Removed {removed} signal(s) from last 7 days")
+        st.rerun()
+
+    st.divider()
+
     # ── Save button ───────────────────────────────────────────────────────────
     if st.button("💾 Save & Apply", use_container_width=True, type="primary"):
         new_wl = [s.strip().upper() for s in wl_text.splitlines() if s.strip()]
