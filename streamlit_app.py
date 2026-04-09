@@ -20,7 +20,7 @@ BASE         = "https://www.okx.com"
 LOOKBACK_30M = 300    # OKX max 300 per request; 300 × 30m = 6.25 days, plenty for avg vol
 
 # OKX interval strings
-OKX_INTERVALS = {"30m": "30m", "5m": "5m", "15m": "15m", "1h": "1H"}
+OKX_INTERVALS = {"30m": "30m", "3m": "3m", "5m": "5m", "15m": "15m", "1h": "1H"}
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Default configuration
@@ -329,6 +329,131 @@ def is_near_resistance(entry, peaks, tolerance):
     return any(entry <= p <= entry * (1 + tolerance) for p in peaks)
 
 # ─────────────────────────────────────────────────────────────────────────────
+# EMA / MACD helpers
+# ─────────────────────────────────────────────────────────────────────────────
+def calc_ema(values: list, period: int) -> list:
+    """Exponential Moving Average. Returns len(values)-period+1 values (seed = SMA)."""
+    if len(values) < period:
+        return []
+    k = 2.0 / (period + 1)
+    result = [sum(values[:period]) / period]
+    for v in values[period:]:
+        result.append(v * k + result[-1] * (1 - k))
+    return result
+
+def calc_macd(closes: list, fast: int = 12, slow: int = 26,
+              signal_period: int = 9):
+    """
+    Returns (macd_line, signal_line, histogram) — all same length.
+    Returns ([], [], []) when there is insufficient data.
+    """
+    if len(closes) < slow + signal_period:
+        return [], [], []
+    ema_f = calc_ema(closes, fast)   # length: len(closes) - fast + 1
+    ema_s = calc_ema(closes, slow)   # length: len(closes) - slow + 1
+    # Align: trim ema_f from front so both series cover the same time window
+    trim = len(ema_f) - len(ema_s)   # = slow - fast
+    ema_f = ema_f[trim:]
+    macd_line = [f - s for f, s in zip(ema_f, ema_s)]
+    if len(macd_line) < signal_period:
+        return [], [], []
+    sig_line = calc_ema(macd_line, signal_period)
+    # Align macd_line with sig_line (sig_line is shorter by signal_period-1)
+    trim2 = len(macd_line) - len(sig_line)
+    macd_aligned = macd_line[trim2:]
+    histogram = [m - s for m, s in zip(macd_aligned, sig_line)]
+    return macd_aligned, sig_line, histogram
+
+def macd_bullish(closes: list, crossover_lookback: int = 12) -> bool:
+    """
+    Returns True when ALL of the following hold:
+      1. MACD line  > 0  (above zero line — bullish territory)
+      2. Signal line > 0  (signal itself in positive zone)
+      3. Histogram  > 0  (MACD above signal — momentum building)
+      4. A bullish MACD crossover (MACD crossed above signal) occurred
+         within the last `crossover_lookback` candles.
+    """
+    macd_line, sig_line, histogram = calc_macd(closes)
+    if not histogram:
+        return False
+    # Conditions 1-3
+    if macd_line[-1] <= 0 or sig_line[-1] <= 0 or histogram[-1] <= 0:
+        return False
+    # Condition 4 — scan backwards for a bullish crossover
+    n = min(crossover_lookback + 1, len(macd_line))
+    for i in range(1, n):
+        prev = -(i + 1)
+        curr = -i
+        if (len(macd_line) + prev >= 0 and
+                macd_line[prev] <= sig_line[prev] and
+                macd_line[curr] >  sig_line[curr]):
+            return True
+    return False
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Parabolic SAR helper
+# ─────────────────────────────────────────────────────────────────────────────
+def calc_parabolic_sar(candles: list, af_start: float = 0.02,
+                       af_step: float = 0.02, af_max: float = 0.20) -> list:
+    """
+    Computes Parabolic SAR for every candle.
+    Returns a list of (sar_value, is_bullish) tuples, same length as candles.
+    is_bullish=True  →  SAR is *below* price (uptrend / bullish momentum).
+    """
+    if not candles:
+        return []
+    if len(candles) < 2:
+        return [(candles[0]["close"], True)]
+
+    highs  = [c["high"]  for c in candles]
+    lows   = [c["low"]   for c in candles]
+    closes = [c["close"] for c in candles]
+
+    # Initialise: detect starting trend from first two closes
+    bullish = closes[1] >= closes[0]
+    ep      = highs[0] if bullish else lows[0]   # extreme point
+    sar     = lows[0]  if bullish else highs[0]
+    af      = af_start
+    result  = [(sar, bullish)]
+
+    for i in range(1, len(candles)):
+        new_sar = sar + af * (ep - sar)
+
+        if bullish:
+            # SAR must not be above the two previous lows (exchange convention)
+            new_sar = min(new_sar, lows[i - 1])
+            if i >= 2:
+                new_sar = min(new_sar, lows[i - 2])
+            if lows[i] < new_sar:           # price broke below SAR → reversal
+                bullish = False
+                new_sar = ep                # SAR jumps to prior EP (highest high)
+                ep      = lows[i]
+                af      = af_start
+            else:                           # still in uptrend
+                if highs[i] > ep:
+                    ep = highs[i]
+                    af = min(af + af_step, af_max)
+        else:
+            # SAR must not be below the two previous highs
+            new_sar = max(new_sar, highs[i - 1])
+            if i >= 2:
+                new_sar = max(new_sar, highs[i - 2])
+            if highs[i] > new_sar:          # price broke above SAR → reversal
+                bullish = True
+                new_sar = ep                # SAR jumps to prior EP (lowest low)
+                ep      = highs[i]
+                af      = af_start
+            else:                           # still in downtrend
+                if lows[i] < ep:
+                    ep = lows[i]
+                    af = min(af + af_step, af_max)
+
+        sar = new_sar
+        result.append((sar, bullish))
+
+    return result
+
+# ─────────────────────────────────────────────────────────────────────────────
 # BTC regime guard
 # ─────────────────────────────────────────────────────────────────────────────
 def get_market_regime(cfg: dict) -> dict:
@@ -355,6 +480,7 @@ def _reset_filter_counts():
     global _filter_counts
     counts = {"checked": 0, "f1_momentum": 0, "f2_body": 0,
               "f4_rsi5m": 0, "f5_res5m": 0, "f6_res15m": 0, "f7_rsi1h": 0,
+              "f8_ema200": 0, "f9_macd": 0, "f10_sar": 0,
               "passed": 0, "errors": 0}
     with _filter_lock:
         _filter_counts.clear()
@@ -401,7 +527,8 @@ def process(sym, cfg: dict, path_b_vol: float, rsi_max: float):
             with _filter_lock: _filter_counts["f2_body"] = _filter_counts.get("f2_body", 0) + 1
             return None
 
-        m5            = get_klines(sym, "5m", 32)[:-1]
+        # ── Fetch 5m candles (210 for EMA 200, MACD, SAR) ────────────────────
+        m5            = get_klines(sym, "5m", 210)[:-1]
         current_price = m5[-1]["close"]
 
         if current_price > ref_candle["close"] * (1 + cfg["move_guard_pct"] / 100):
@@ -421,7 +548,8 @@ def process(sym, cfg: dict, path_b_vol: float, rsi_max: float):
             with _filter_lock: _filter_counts["f5_res5m"] = _filter_counts.get("f5_res5m", 0) + 1
             return None
 
-        m15       = get_klines(sym, "15m", 32)[:-1]
+        # ── Fetch 15m candles (210 for EMA 200, MACD, SAR) ───────────────────
+        m15       = get_klines(sym, "15m", 210)[:-1]
         peaks_15m = find_swing_highs(m15[-25:], neighbors=2)
         if is_near_resistance(entry, peaks_15m, tol):
             with _filter_lock: _filter_counts["f6_res15m"] = _filter_counts.get("f6_res15m", 0) + 1
@@ -430,6 +558,39 @@ def process(sym, cfg: dict, path_b_vol: float, rsi_max: float):
         rsi1h = (calc_rsi_series([c["close"] for c in get_klines(sym, "1h", 19)[:-1]]) or [0])[-1]
         if not (cfg["rsi_1h_min"] <= rsi1h <= rsi_max):
             with _filter_lock: _filter_counts["f7_rsi1h"] = _filter_counts.get("f7_rsi1h", 0) + 1
+            return None
+
+        # ── F8 — EMA 200 filter (price must be above EMA 200 on 5m AND 15m) ──
+        closes_5m  = [c["close"] for c in m5]
+        closes_15m = [c["close"] for c in m15]
+        ema200_5m  = calc_ema(closes_5m,  200)
+        ema200_15m = calc_ema(closes_15m, 200)
+        if (not ema200_5m  or entry < ema200_5m[-1] or
+                not ema200_15m or entry < ema200_15m[-1]):
+            with _filter_lock: _filter_counts["f8_ema200"] = _filter_counts.get("f8_ema200", 0) + 1
+            return None
+
+        # ── F9 — MACD bullish crossover filter (3m, 5m, 15m) ─────────────────
+        # Conditions per timeframe:
+        #   • MACD line > 0 (above zero line)
+        #   • Signal line > 0
+        #   • Histogram > 0 (MACD above signal)
+        #   • Bullish crossover occurred within last 12 candles
+        m3_candles  = get_klines(sym, "3m", 80)[:-1]
+        closes_3m   = [c["close"] for c in m3_candles]
+        if (not macd_bullish(closes_3m) or
+                not macd_bullish(closes_5m) or
+                not macd_bullish(closes_15m)):
+            with _filter_lock: _filter_counts["f9_macd"] = _filter_counts.get("f9_macd", 0) + 1
+            return None
+
+        # ── F10 — Parabolic SAR bullish (5m AND 15m) ─────────────────────────
+        # SAR must be below the current price on both timeframes
+        sar_5m  = calc_parabolic_sar(m5)
+        sar_15m = calc_parabolic_sar(m15)
+        if (not sar_5m  or not sar_5m[-1][1] or
+                not sar_15m or not sar_15m[-1][1]):
+            with _filter_lock: _filter_counts["f10_sar"] = _filter_counts.get("f10_sar", 0) + 1
             return None
 
         tp  = round(entry * (1 + cfg["tp_pct"] / 100), 6)
@@ -926,19 +1087,45 @@ fc = dict(_filter_counts)
 if fc.get("checked", 0) > 0:
     with st.expander("🔬 Last scan filter funnel"):
         checked = fc.get("checked", 0)
+        f1  = fc.get("f1_momentum", 0)
+        f2  = fc.get("f2_body",     0)
+        f4  = fc.get("f4_rsi5m",    0)
+        f5  = fc.get("f5_res5m",    0)
+        f6  = fc.get("f6_res15m",   0)
+        f7  = fc.get("f7_rsi1h",    0)
+        f8  = fc.get("f8_ema200",   0)
+        f9  = fc.get("f9_macd",     0)
+        f10 = fc.get("f10_sar",     0)
+
+        after_f1  = checked - f1
+        after_f2  = after_f1  - f2
+        after_f4  = after_f2  - f4
+        after_f5  = after_f4  - f5
+        after_f6  = after_f5  - f6
+        after_f7  = after_f6  - f7
+        after_f8  = after_f7  - f8
+        after_f9  = after_f8  - f9
+
         funnel_data = [
-            ("Checked",        checked),
-            ("After F1 Mom.",  checked - fc.get("f1_momentum", 0)),
-            ("After F2 Body",  checked - fc.get("f1_momentum", 0) - fc.get("f2_body", 0)),
-            ("After F4 5mRSI", checked - fc.get("f1_momentum", 0) - fc.get("f2_body", 0) - fc.get("f4_rsi5m", 0)),
-            ("After F5 5mRes", checked - fc.get("f1_momentum", 0) - fc.get("f2_body", 0) - fc.get("f4_rsi5m", 0) - fc.get("f5_res5m", 0)),
-            ("After F6 15mR.", checked - fc.get("f1_momentum", 0) - fc.get("f2_body", 0) - fc.get("f4_rsi5m", 0) - fc.get("f5_res5m", 0) - fc.get("f6_res15m", 0)),
-            ("Passed F7 1hR.", fc.get("passed", 0)),
+            ("Checked",           checked),
+            ("After F1 Mom.",     after_f1),
+            ("After F2 Body",     after_f2),
+            ("After F4 5m RSI",   after_f4),
+            ("After F5 5m Res.",  after_f5),
+            ("After F6 15m Res.", after_f6),
+            ("After F7 1h RSI",   after_f7),
+            ("After F8 EMA 200",  after_f8),
+            ("After F9 MACD",     after_f9),
+            ("Passed F10 SAR",    fc.get("passed", 0)),
         ]
         fig_funnel = go.Figure(go.Funnel(
             y=[d[0] for d in funnel_data],
             x=[d[1] for d in funnel_data],
-            marker=dict(color=["#58a6ff","#79c0ff","#a5d6ff","#cae8ff","#3fb950","#56d364","#d29922"]),
+            marker=dict(color=[
+                "#58a6ff","#79c0ff","#a5d6ff","#cae8ff",
+                "#3fb950","#56d364","#d29922","#e3b341",
+                "#bc8cff","#f85149",
+            ]),
             textinfo="value+percent initial",
         ))
         fig_funnel.update_layout(
@@ -946,7 +1133,7 @@ if fc.get("checked", 0) > 0:
             plot_bgcolor="rgba(0,0,0,0)",
             font=dict(color="#e6edf3"),
             margin=dict(t=10, b=10, l=10, r=10),
-            height=320,
+            height=400,
         )
         st.plotly_chart(fig_funnel, use_container_width=True)
         st.caption(f"Errors this cycle: {fc.get('errors', 0)}")
