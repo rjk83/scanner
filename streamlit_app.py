@@ -28,12 +28,6 @@ OKX_INTERVALS = {"30m": "30m", "3m": "3m", "5m": "5m", "15m": "15m", "1h": "1H"}
 DEFAULT_CONFIG: dict = {
     "tp_pct":             2.0,
     "sl_pct":             1.0,
-    "path_a_vol_min":     2.0,
-    "lookback_candles":   8,
-    "path_b_vol_min":     1.8,
-    "path_b_gain_min":    0.8,
-    "move_guard_pct":     3.5,
-    "body_ratio_min":     0.40,
     "rsi_5m_min":         45,
     "resistance_tol_pct": 1.5,
     "rsi_1h_min":         40,
@@ -167,7 +161,7 @@ def load_log():
         except Exception: pass
     return {"health": {"total_cycles": 0, "last_scan_at": None,
                         "last_scan_duration_s": 0.0, "total_api_errors": 0,
-                        "watchlist_size": 0, "btc_regime": "—", "btc_rsi": 0.0},
+                        "watchlist_size": 0},
             "signals": []}
 
 def save_log(log):
@@ -457,31 +451,11 @@ def calc_parabolic_sar(candles: list, af_start: float = 0.02,
     return result
 
 # ─────────────────────────────────────────────────────────────────────────────
-# BTC regime guard
-# ─────────────────────────────────────────────────────────────────────────────
-def get_market_regime(cfg: dict) -> dict:
-    try:
-        btc_closes = [c["close"] for c in get_klines("BTCUSDT", "1h", 19)[:-1]]
-        rsi = (calc_rsi_series(btc_closes) or [55.0])[-1]
-    except Exception:
-        rsi = 55.0
-    base_vol = cfg["path_b_vol_min"]
-    base_rsi = cfg["rsi_1h_max"]
-    if rsi > 80:
-        return {"btc_rsi": rsi, "label": "Overbought", "path_b_vol": max(base_vol, 3.0), "rsi_max": min(base_rsi, 68)}
-    elif rsi > 70:
-        return {"btc_rsi": rsi, "label": "Extended",   "path_b_vol": max(base_vol, 2.2), "rsi_max": min(base_rsi, 72)}
-    elif rsi < 45:
-        return {"btc_rsi": rsi, "label": "Weak BTC",   "path_b_vol": max(base_vol, 2.5), "rsi_max": min(base_rsi, 72)}
-    else:
-        return {"btc_rsi": rsi, "label": "Normal",     "path_b_vol": base_vol,            "rsi_max": base_rsi}
-
-# ─────────────────────────────────────────────────────────────────────────────
 # Core filter logic
 # ─────────────────────────────────────────────────────────────────────────────
 def _reset_filter_counts():
     global _filter_counts
-    counts = {"checked": 0, "f1_momentum": 0, "f2_body": 0,
+    counts = {"checked": 0,
               "f4_rsi5m": 0, "f5_res5m": 0, "f6_res15m": 0, "f7_rsi1h": 0,
               "f8_ema200": 0, "f9_macd": 0, "f10_sar": 0,
               "passed": 0, "errors": 0}
@@ -490,53 +464,13 @@ def _reset_filter_counts():
         _filter_counts.update(counts)
     _b._bsc_filter_counts = _filter_counts
 
-def process(sym, cfg: dict, path_b_vol: float, rsi_max: float):
+def process(sym, cfg: dict):
     try:
         with _filter_lock: _filter_counts["checked"] = _filter_counts.get("checked", 0) + 1
 
-        raw_30m   = get_klines(sym, "30m", LOOKBACK_30M)
-        completed = raw_30m[:-1]
-        lb        = max(1, int(cfg["lookback_candles"]))
-        hist_30m  = completed[:-lb]
-        avg_vol   = sum(x["volume"] for x in hist_30m) / len(hist_30m) if hist_30m else 0
-
-        ref_candle = None
-        ratio      = 0.0
-        for cand in completed[-lb:]:
-            if not (cand["close"] > cand["open"]): continue
-            r = cand["volume"] / avg_vol if avg_vol else 0
-            if r >= cfg["path_a_vol_min"] and r > ratio:
-                ref_candle = cand
-                ratio      = r
-
-        last3 = completed[-3:]
-        if all(c["close"] > c["open"] for c in last3):
-            avg3     = sum(c["volume"] for c in last3) / 3
-            r3       = avg3 / avg_vol if avg_vol else 0
-            gain_pct = (last3[-1]["close"] - last3[0]["open"]) / last3[0]["open"] * 100
-            if r3 >= path_b_vol and gain_pct >= cfg["path_b_gain_min"]:
-                if ref_candle is None or r3 > ratio:
-                    ref_candle = completed[-1]
-                    ratio      = r3
-
-        if ref_candle is None:
-            with _filter_lock: _filter_counts["f1_momentum"] = _filter_counts.get("f1_momentum", 0) + 1
-            return None
-
-        cr   = ref_candle["high"] - ref_candle["low"]
-        body = ref_candle["close"] - ref_candle["open"]
-        bp   = (body / cr) if cr > 0 else 1.0
-        if cr > 0 and bp < cfg["body_ratio_min"]:
-            with _filter_lock: _filter_counts["f2_body"] = _filter_counts.get("f2_body", 0) + 1
-            return None
-
-        # ── Fetch 5m candles (210 for EMA 200, MACD, SAR) ────────────────────
+        # ── Fetch 5m candles (210 for EMA, MACD, SAR) ────────────────────────
         m5            = get_klines(sym, "5m", 210)[:-1]
         current_price = m5[-1]["close"]
-
-        if current_price > ref_candle["close"] * (1 + cfg["move_guard_pct"] / 100):
-            with _filter_lock: _filter_counts["f1_momentum"] = _filter_counts.get("f1_momentum", 0) + 1
-            return None
 
         rsi5 = (calc_rsi_series([c["close"] for c in m5]) or [0])[-1]
         if rsi5 < cfg["rsi_5m_min"]:
@@ -559,7 +493,7 @@ def process(sym, cfg: dict, path_b_vol: float, rsi_max: float):
             return None
 
         rsi1h = (calc_rsi_series([c["close"] for c in get_klines(sym, "1h", 19)[:-1]]) or [0])[-1]
-        if not (cfg["rsi_1h_min"] <= rsi1h <= rsi_max):
+        if not (cfg["rsi_1h_min"] <= rsi1h <= cfg["rsi_1h_max"]):
             with _filter_lock: _filter_counts["f7_rsi1h"] = _filter_counts.get("f7_rsi1h", 0) + 1
             return None
 
@@ -611,7 +545,6 @@ def process(sym, cfg: dict, path_b_vol: float, rsi_max: float):
             "entry":       entry,
             "tp":          tp,
             "sl":          sl,
-            "ratio":       round(ratio, 2),
             "sector":      sec,
             "status":      "open",
             "close_price": None,
@@ -623,17 +556,16 @@ def process(sym, cfg: dict, path_b_vol: float, rsi_max: float):
 
 def scan(cfg: dict):
     _reset_filter_counts()
-    regime  = get_market_regime(cfg)
     symbols = get_symbols(cfg["watchlist"])
     results = []
     with ThreadPoolExecutor(max_workers=8) as exe:
-        futs = [exe.submit(process, s, cfg, regime["path_b_vol"], regime["rsi_max"])
-                for s in symbols]
+        futs = [exe.submit(process, s, cfg) for s in symbols]
         for f in as_completed(futs):
             r = f.result()
             if r and r != "error":
                 results.append(r)
-    return sorted(results, key=lambda x: x["ratio"], reverse=True), _filter_counts.get("errors", 0), regime
+    # Sort by symbol name for deterministic ordering
+    return sorted(results, key=lambda x: x["symbol"]), _filter_counts.get("errors", 0)
 
 def update_open_signals(signals):
     for sig in signals:
@@ -671,7 +603,7 @@ def _bg_loop():
         try:
             with _log_lock:
                 _b._bsc_log["signals"] = update_open_signals(_b._bsc_log["signals"])
-            new_sigs, errors, regime = scan(cfg)
+            new_sigs, errors = scan(cfg)
             cutoff      = datetime.now(timezone.utc) - timedelta(minutes=cfg["cooldown_minutes"])
             with _log_lock:
                 cooled  = {s["symbol"] for s in _b._bsc_log["signals"]
@@ -689,8 +621,6 @@ def _bg_loop():
                     last_scan_duration_s = round(elapsed, 1),
                     total_api_errors     = _b._bsc_log["health"].get("total_api_errors", 0) + errors,
                     watchlist_size       = len(cfg["watchlist"]),
-                    btc_regime           = regime["label"],
-                    btc_rsi              = round(regime["btc_rsi"], 1),
                 )
                 save_log(_b._bsc_log)
             _b._bsc_last_error = ""
@@ -758,28 +688,6 @@ with st.sidebar:
                               value=float(_snap_cfg["tp_pct"]), key="cfg_tp")
     new_sl = c2.number_input("SL %", min_value=0.1, max_value=20.0, step=0.1,
                               value=float(_snap_cfg["sl_pct"]), key="cfg_sl")
-
-    st.divider()
-
-    # ── F1 Momentum ───────────────────────────────────────────────────────────
-    st.markdown("**🔥 F1 — Momentum**")
-    new_pa_vol = st.number_input("Path A vol min (×avg)", 0.5, 10.0, step=0.1,
-                                  value=float(_snap_cfg["path_a_vol_min"]), key="cfg_pa_vol")
-    new_lb = st.number_input("Lookback candles (30m)", 1, 48, step=1,
-                               value=int(_snap_cfg["lookback_candles"]), key="cfg_lb")
-    new_pb_vol = st.number_input("Path B vol min (×avg)", 0.5, 10.0, step=0.1,
-                                  value=float(_snap_cfg["path_b_vol_min"]), key="cfg_pb_vol")
-    new_pb_gain = st.number_input("Path B gain min (%)", 0.0, 10.0, step=0.1,
-                                   value=float(_snap_cfg["path_b_gain_min"]), key="cfg_pb_gain")
-    new_mg = st.number_input("Move guard (%)", 0.5, 20.0, step=0.1,
-                              value=float(_snap_cfg["move_guard_pct"]), key="cfg_mg")
-
-    st.divider()
-
-    # ── F2 Body quality ───────────────────────────────────────────────────────
-    st.markdown("**📐 F2 — Body Quality**")
-    new_body = st.number_input("Body ratio min (0–1)", 0.0, 1.0, step=0.05,
-                                value=float(_snap_cfg["body_ratio_min"]), key="cfg_body")
 
     st.divider()
 
@@ -866,7 +774,7 @@ with st.sidebar:
             _b._bsc_log["health"] = {
                 "total_cycles": 0, "last_scan_at": None,
                 "last_scan_duration_s": 0.0, "total_api_errors": 0,
-                "watchlist_size": 0, "btc_regime": "—", "btc_rsi": 0.0,
+                "watchlist_size": 0,
             }
             save_log(_b._bsc_log)
         st.success("✅ All data flushed")
@@ -905,18 +813,23 @@ with st.sidebar:
 
     st.divider()
 
+    # ── Reset to Defaults ─────────────────────────────────────────────────────
+    if st.button("↩️ Reset to Defaults", use_container_width=True, type="secondary",
+                 help="Restore every setting to the built-in default values."):
+        default_cfg = dict(DEFAULT_CONFIG)
+        with _config_lock:
+            _b._bsc_cfg.clear()
+            _b._bsc_cfg.update(default_cfg)
+        save_config(default_cfg)
+        st.success("✅ All settings reset to defaults")
+        st.rerun()
+
     # ── Save button ───────────────────────────────────────────────────────────
     if st.button("💾 Save & Apply", use_container_width=True, type="primary"):
         new_wl = [s.strip().upper() for s in wl_text.splitlines() if s.strip()]
         new_cfg = {
             "tp_pct":             new_tp,
             "sl_pct":             new_sl,
-            "path_a_vol_min":     new_pa_vol,
-            "lookback_candles":   int(new_lb),
-            "path_b_vol_min":     new_pb_vol,
-            "path_b_gain_min":    new_pb_gain,
-            "move_guard_pct":     new_mg,
-            "body_ratio_min":     new_body,
             "rsi_5m_min":         int(new_rsi5_min),
             "resistance_tol_pct": new_res_tol,
             "rsi_1h_min":         int(new_rsi1h_min),
@@ -955,25 +868,6 @@ col_h1, col_h2 = st.columns([3, 1])
 col_h1.caption(f"Last scan: {last_scan}   |   Auto-refreshes every 30 s")
 if col_h2.button("🔄 Refresh now", key="manual_refresh"):
     st.rerun()
-
-# ── BTC Regime banner ─────────────────────────────────────────────────────────
-regime_label = health.get("btc_regime", "—")
-btc_rsi      = health.get("btc_rsi", 0.0)
-regime_styles = {
-    "Normal":     ("🟢", "#1a3d2b", "#3fb950"),
-    "Extended":   ("🟠", "#3d2e0d", "#d29922"),
-    "Overbought": ("🔴", "#3d0d0d", "#f85149"),
-    "Weak BTC":   ("🔵", "#0d2040", "#58a6ff"),
-}
-icon, bg, fg = regime_styles.get(regime_label, ("⚪", "#1c2128", "#8b949e"))
-st.markdown(
-    f"<div style='background:{bg};border:1px solid {fg};border-radius:6px;"
-    f"padding:10px 16px;margin-bottom:12px;font-size:15px'>"
-    f"<b style='color:{fg}'>{icon} BTC Regime: {regime_label}</b>"
-    f"  &nbsp;|&nbsp;  1h RSI: <b style='color:{fg}'>{btc_rsi}</b>"
-    f"</div>",
-    unsafe_allow_html=True,
-)
 
 # ── Health metrics ────────────────────────────────────────────────────────────
 open_count = sum(1 for s in signals if s["status"] == "open")
@@ -1033,7 +927,6 @@ if filtered_sorted:
             "Entry":   s.get("entry", ""),
             "TP":      s.get("tp", ""),
             "SL":      s.get("sl", ""),
-            "Ratio":   f"{s.get('ratio', 0)}×",
             "Status":  status_icon,
             "Close $": s.get("close_price") or "—",
         })
@@ -1128,44 +1021,42 @@ fc = dict(_filter_counts)
 if fc.get("checked", 0) > 0:
     with st.expander("🔬 Last scan filter funnel"):
         checked = fc.get("checked", 0)
-        f1  = fc.get("f1_momentum", 0)
-        f2  = fc.get("f2_body",     0)
-        f4  = fc.get("f4_rsi5m",    0)
-        f5  = fc.get("f5_res5m",    0)
-        f6  = fc.get("f6_res15m",   0)
-        f7  = fc.get("f7_rsi1h",    0)
-        f8  = fc.get("f8_ema200",   0)
-        f9  = fc.get("f9_macd",     0)
-        f10 = fc.get("f10_sar",     0)
+        f4  = fc.get("f4_rsi5m",  0)
+        f5  = fc.get("f5_res5m",  0)
+        f6  = fc.get("f6_res15m", 0)
+        f7  = fc.get("f7_rsi1h",  0)
+        f8  = fc.get("f8_ema200", 0)
+        f9  = fc.get("f9_macd",   0)
+        f10 = fc.get("f10_sar",   0)
 
-        after_f1  = checked - f1
-        after_f2  = after_f1  - f2
-        after_f4  = after_f2  - f4
+        after_f4  = checked   - f4
         after_f5  = after_f4  - f5
         after_f6  = after_f5  - f6
         after_f7  = after_f6  - f7
         after_f8  = after_f7  - f8
         after_f9  = after_f8  - f9
 
+        ema_lbl = f"After F8 EMA {_snap_cfg.get('ema_period', 200)}" + \
+                  ("" if _snap_cfg.get("use_ema200", True) else " (off)")
+        sar_lbl = "Passed F10 SAR" + \
+                  ("" if _snap_cfg.get("use_sar", True) else " (off)")
+
         funnel_data = [
             ("Checked",           checked),
-            ("After F1 Mom.",     after_f1),
-            ("After F2 Body",     after_f2),
             ("After F4 5m RSI",   after_f4),
             ("After F5 5m Res.",  after_f5),
             ("After F6 15m Res.", after_f6),
             ("After F7 1h RSI",   after_f7),
-            (f"After F8 EMA {_snap_cfg.get('ema_period', 200)}" + (" ✓" if _snap_cfg.get("use_ema200", True) else " (off)"), after_f8),
+            (ema_lbl,             after_f8),
             ("After F9 MACD",     after_f9),
-            ("Passed F10 SAR" + (" ✓" if _snap_cfg.get("use_sar", True) else " (off)"), fc.get("passed", 0)),
+            (sar_lbl,             fc.get("passed", 0)),
         ]
         fig_funnel = go.Figure(go.Funnel(
             y=[d[0] for d in funnel_data],
             x=[d[1] for d in funnel_data],
             marker=dict(color=[
-                "#58a6ff","#79c0ff","#a5d6ff","#cae8ff",
-                "#3fb950","#56d364","#d29922","#e3b341",
-                "#bc8cff","#f85149",
+                "#58a6ff","#79c0ff","#a5d6ff",
+                "#3fb950","#56d364","#d29922","#e3b341","#f85149",
             ]),
             textinfo="value+percent initial",
         ))
