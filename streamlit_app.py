@@ -34,9 +34,21 @@ DEFAULT_CONFIG: dict = {
     "rsi_1h_max":         72,
     "loop_minutes":       3,
     "cooldown_minutes":   30,
-    "use_ema200":         True,
-    "ema_period":         200,
+    # ── EMA per-timeframe ────────────────────────────────────────────────────
+    "use_ema_3m":         False,
+    "ema_period_3m":      200,
+    "use_ema_5m":         True,
+    "ema_period_5m":      200,
+    "use_ema_15m":        True,
+    "ema_period_15m":     200,
+    # ── MACD ─────────────────────────────────────────────────────────────────
+    "use_macd":           True,
+    # ── Parabolic SAR ────────────────────────────────────────────────────────
     "use_sar":            True,
+    # ── Volume spike ─────────────────────────────────────────────────────────
+    "use_vol_spike":      False,
+    "vol_spike_mult":     2.0,
+    "vol_spike_lookback": 20,
     "watchlist": [
         "PTBUSDT","SANTOSUSDT","XRPUSDT","HEMIUSDT","OGUSDT","SIRENUSDT",
         "BANUSDT","BASUSDT","4USDT","MAGMAUSDT","XANUSDT","TRIAUSDT",
@@ -142,7 +154,10 @@ def load_config() -> dict:
         try:
             saved = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
             cfg = dict(DEFAULT_CONFIG)
-            cfg.update(saved)
+            # Only copy keys that still exist in DEFAULT_CONFIG (drops stale keys)
+            for k in DEFAULT_CONFIG:
+                if k in saved:
+                    cfg[k] = saved[k]
             return cfg
         except Exception:
             pass
@@ -172,7 +187,6 @@ def save_log(log):
 # Module-level shared state  (persists across Streamlit reruns in same process)
 # ─────────────────────────────────────────────────────────────────────────────
 if "_scanner_initialised" not in st.session_state:
-    # Only initialise globals once per process lifetime
     import builtins
     if not getattr(builtins, "_binance_scanner_globals_set", False):
         import builtins as _b
@@ -222,15 +236,12 @@ def safe_get(url, params=None, _retries=4):
             if r.status_code == 429:
                 time.sleep(int(r.headers.get("Retry-After", 60))); continue
             if r.status_code in (418, 403, 451):
-                # 403/451 = datacenter IP blocked by exchange
-                # If OKX also returns these, switch hosting to Railway/Fly.io
                 raise RuntimeError(
                     f"HTTP {r.status_code}: Exchange is blocking this server's IP. "
                     "Deploy on Railway (railway.app) instead — uses non-datacenter IPs."
                 )
             r.raise_for_status()
             data = r.json()
-            # OKX wraps results: code "0" (string) = success
             if isinstance(data, dict) and "code" in data and data["code"] != "0":
                 raise RuntimeError(f"OKX API error {data['code']}: {data.get('msg', '')}")
             return data
@@ -270,7 +281,7 @@ def get_klines(sym: str, interval: str, limit: int) -> list:
     okx_iv  = OKX_INTERVALS.get(interval, interval)
     inst_id = _to_okx(sym)
     all_bars: list = []
-    after = None          # OKX 'after' = fetch bars OLDER than this ts
+    after = None
 
     while len(all_bars) < limit:
         batch  = min(300, limit - len(all_bars))
@@ -282,7 +293,7 @@ def get_klines(sym: str, interval: str, limit: int) -> list:
         if not bars:
             break
         all_bars.extend(bars)
-        after = bars[-1][0]          # oldest timestamp in this batch → page backwards
+        after = bars[-1][0]
         if len(bars) < batch:
             break
 
@@ -346,16 +357,14 @@ def calc_macd(closes: list, fast: int = 12, slow: int = 26,
     """
     if len(closes) < slow + signal_period:
         return [], [], []
-    ema_f = calc_ema(closes, fast)   # length: len(closes) - fast + 1
-    ema_s = calc_ema(closes, slow)   # length: len(closes) - slow + 1
-    # Align: trim ema_f from front so both series cover the same time window
-    trim = len(ema_f) - len(ema_s)   # = slow - fast
+    ema_f = calc_ema(closes, fast)
+    ema_s = calc_ema(closes, slow)
+    trim = len(ema_f) - len(ema_s)
     ema_f = ema_f[trim:]
     macd_line = [f - s for f, s in zip(ema_f, ema_s)]
     if len(macd_line) < signal_period:
         return [], [], []
     sig_line = calc_ema(macd_line, signal_period)
-    # Align macd_line with sig_line (sig_line is shorter by signal_period-1)
     trim2 = len(macd_line) - len(sig_line)
     macd_aligned = macd_line[trim2:]
     histogram = [m - s for m, s in zip(macd_aligned, sig_line)]
@@ -363,20 +372,20 @@ def calc_macd(closes: list, fast: int = 12, slow: int = 26,
 
 def macd_bullish(closes: list, crossover_lookback: int = 12) -> bool:
     """
-    Returns True when ALL of the following hold:
-      1. MACD line  > 0  (above zero line — bullish territory)
-      2. Signal line > 0  (signal itself in positive zone)
+    Returns True when ALL of the following hold on the given closes:
+      1. MACD line  > 0  (above zero — bullish territory)
+      2. Signal line > 0  (signal in positive zone)
       3. Histogram  > 0  (MACD above signal — momentum building)
-      4. A bullish MACD crossover (MACD crossed above signal) occurred
-         within the last `crossover_lookback` candles.
+      4. A bullish crossover (MACD crossed above signal) within last
+         `crossover_lookback` candles.
     """
     macd_line, sig_line, histogram = calc_macd(closes)
     if not histogram:
         return False
-    # Conditions 1-3
+    # Conditions 1-3: all three components must be positive
     if macd_line[-1] <= 0 or sig_line[-1] <= 0 or histogram[-1] <= 0:
         return False
-    # Condition 4 — scan backwards for a bullish crossover
+    # Condition 4: scan for a recent bullish crossover
     n = min(crossover_lookback + 1, len(macd_line))
     for i in range(1, n):
         prev = -(i + 1)
@@ -406,9 +415,8 @@ def calc_parabolic_sar(candles: list, af_start: float = 0.02,
     lows   = [c["low"]   for c in candles]
     closes = [c["close"] for c in candles]
 
-    # Initialise: detect starting trend from first two closes
     bullish = closes[1] >= closes[0]
-    ep      = highs[0] if bullish else lows[0]   # extreme point
+    ep      = highs[0] if bullish else lows[0]
     sar     = lows[0]  if bullish else highs[0]
     af      = af_start
     result  = [(sar, bullish)]
@@ -417,30 +425,28 @@ def calc_parabolic_sar(candles: list, af_start: float = 0.02,
         new_sar = sar + af * (ep - sar)
 
         if bullish:
-            # SAR must not be above the two previous lows (exchange convention)
             new_sar = min(new_sar, lows[i - 1])
             if i >= 2:
                 new_sar = min(new_sar, lows[i - 2])
-            if lows[i] < new_sar:           # price broke below SAR → reversal
+            if lows[i] < new_sar:
                 bullish = False
-                new_sar = ep                # SAR jumps to prior EP (highest high)
+                new_sar = ep
                 ep      = lows[i]
                 af      = af_start
-            else:                           # still in uptrend
+            else:
                 if highs[i] > ep:
                     ep = highs[i]
                     af = min(af + af_step, af_max)
         else:
-            # SAR must not be below the two previous highs
             new_sar = max(new_sar, highs[i - 1])
             if i >= 2:
                 new_sar = max(new_sar, highs[i - 2])
-            if highs[i] > new_sar:          # price broke above SAR → reversal
+            if highs[i] > new_sar:
                 bullish = True
-                new_sar = ep                # SAR jumps to prior EP (lowest low)
+                new_sar = ep
                 ep      = highs[i]
                 af      = af_start
-            else:                           # still in downtrend
+            else:
                 if lows[i] < ep:
                     ep = lows[i]
                     af = min(af + af_step, af_max)
@@ -455,10 +461,19 @@ def calc_parabolic_sar(candles: list, af_start: float = 0.02,
 # ─────────────────────────────────────────────────────────────────────────────
 def _reset_filter_counts():
     global _filter_counts
-    counts = {"checked": 0,
-              "f4_rsi5m": 0, "f5_res5m": 0, "f6_res15m": 0, "f7_rsi1h": 0,
-              "f8_ema200": 0, "f9_macd": 0, "f10_sar": 0,
-              "passed": 0, "errors": 0}
+    counts = {
+        "checked":    0,
+        "f4_rsi5m":   0,
+        "f5_res5m":   0,
+        "f6_res15m":  0,
+        "f7_rsi1h":   0,
+        "f8_ema":     0,
+        "f9_macd":    0,
+        "f10_sar":    0,
+        "f11_vol":    0,
+        "passed":     0,
+        "errors":     0,
+    }
     with _filter_lock:
         _filter_counts.clear()
         _filter_counts.update(counts)
@@ -471,8 +486,9 @@ def process(sym, cfg: dict):
         # ── Fetch 5m candles (210 for EMA, MACD, SAR) ────────────────────────
         m5            = get_klines(sym, "5m", 210)[:-1]
         current_price = m5[-1]["close"]
+        closes_5m     = [c["close"] for c in m5]
 
-        rsi5 = (calc_rsi_series([c["close"] for c in m5]) or [0])[-1]
+        rsi5 = (calc_rsi_series(closes_5m) or [0])[-1]
         if rsi5 < cfg["rsi_5m_min"]:
             with _filter_lock: _filter_counts["f4_rsi5m"] = _filter_counts.get("f4_rsi5m", 0) + 1
             return None
@@ -485,8 +501,10 @@ def process(sym, cfg: dict):
             with _filter_lock: _filter_counts["f5_res5m"] = _filter_counts.get("f5_res5m", 0) + 1
             return None
 
-        # ── Fetch 15m candles (210 for EMA 200, MACD, SAR) ───────────────────
-        m15       = get_klines(sym, "15m", 210)[:-1]
+        # ── Fetch 15m candles ────────────────────────────────────────────────
+        m15        = get_klines(sym, "15m", 210)[:-1]
+        closes_15m = [c["close"] for c in m15]
+
         peaks_15m = find_swing_highs(m15[-25:], neighbors=2)
         if is_near_resistance(entry, peaks_15m, tol):
             with _filter_lock: _filter_counts["f6_res15m"] = _filter_counts.get("f6_res15m", 0) + 1
@@ -497,41 +515,72 @@ def process(sym, cfg: dict):
             with _filter_lock: _filter_counts["f7_rsi1h"] = _filter_counts.get("f7_rsi1h", 0) + 1
             return None
 
-        # ── F8 — EMA filter (price must be above EMA on 5m AND 15m) ─────────
-        closes_5m  = [c["close"] for c in m5]
-        closes_15m = [c["close"] for c in m15]
-        if cfg.get("use_ema200", True):
-            ema_p      = max(2, int(cfg.get("ema_period", 200)))
-            ema_5m     = calc_ema(closes_5m,  ema_p)
-            ema_15m    = calc_ema(closes_15m, ema_p)
-            if (not ema_5m  or entry < ema_5m[-1] or
-                    not ema_15m or entry < ema_15m[-1]):
-                with _filter_lock: _filter_counts["f8_ema200"] = _filter_counts.get("f8_ema200", 0) + 1
+        # ── Fetch 3m candles (needed for EMA/MACD/SAR on 3m) ─────────────────
+        m3_candles = get_klines(sym, "3m", 80)[:-1]
+        closes_3m  = [c["close"] for c in m3_candles]
+
+        # ── F8 — EMA filter (per-timeframe, each individually configurable) ───
+        # 3m EMA
+        if cfg.get("use_ema_3m", False):
+            ema_p_3m = max(2, int(cfg.get("ema_period_3m", 200)))
+            ema_3m   = calc_ema(closes_3m, ema_p_3m)
+            if not ema_3m or entry < ema_3m[-1]:
+                with _filter_lock: _filter_counts["f8_ema"] = _filter_counts.get("f8_ema", 0) + 1
+                return None
+        # 5m EMA
+        if cfg.get("use_ema_5m", True):
+            ema_p_5m = max(2, int(cfg.get("ema_period_5m", 200)))
+            ema_5m   = calc_ema(closes_5m, ema_p_5m)
+            if not ema_5m or entry < ema_5m[-1]:
+                with _filter_lock: _filter_counts["f8_ema"] = _filter_counts.get("f8_ema", 0) + 1
+                return None
+        # 15m EMA
+        if cfg.get("use_ema_15m", True):
+            ema_p_15m = max(2, int(cfg.get("ema_period_15m", 200)))
+            ema_15m   = calc_ema(closes_15m, ema_p_15m)
+            if not ema_15m or entry < ema_15m[-1]:
+                with _filter_lock: _filter_counts["f8_ema"] = _filter_counts.get("f8_ema", 0) + 1
                 return None
 
-        # ── F9 — MACD bullish crossover filter (3m, 5m, 15m) ─────────────────
-        # Conditions per timeframe:
-        #   • MACD line > 0 (above zero line)
+        # ── F9 — MACD bullish filter (3m, 5m, 15m) ───────────────────────────
+        # Per-timeframe conditions checked:
+        #   • MACD line > 0  (above zero — bullish territory)
         #   • Signal line > 0
-        #   • Histogram > 0 (MACD above signal)
-        #   • Bullish crossover occurred within last 12 candles
-        m3_candles  = get_klines(sym, "3m", 80)[:-1]
-        closes_3m   = [c["close"] for c in m3_candles]
-        if (not macd_bullish(closes_3m) or
-                not macd_bullish(closes_5m) or
-                not macd_bullish(closes_15m)):
-            with _filter_lock: _filter_counts["f9_macd"] = _filter_counts.get("f9_macd", 0) + 1
-            return None
+        #   • Histogram > 0  (momentum building — MACD above signal)
+        #   • Bullish crossover (MACD crossed above signal) within last 12 candles
+        if cfg.get("use_macd", True):
+            if (not macd_bullish(closes_3m) or
+                    not macd_bullish(closes_5m) or
+                    not macd_bullish(closes_15m)):
+                with _filter_lock: _filter_counts["f9_macd"] = _filter_counts.get("f9_macd", 0) + 1
+                return None
 
-        # ── F10 — Parabolic SAR bullish (5m AND 15m) ─────────────────────────
-        # SAR must be below the current price on both timeframes
+        # ── F10 — Parabolic SAR bullish (3m, 5m AND 15m) ─────────────────────
+        # SAR must be BELOW price on all three timeframes
         if cfg.get("use_sar", True):
+            sar_3m  = calc_parabolic_sar(m3_candles)
             sar_5m  = calc_parabolic_sar(m5)
             sar_15m = calc_parabolic_sar(m15)
-            if (not sar_5m  or not sar_5m[-1][1] or
+            if (not sar_3m  or not sar_3m[-1][1] or
+                    not sar_5m  or not sar_5m[-1][1] or
                     not sar_15m or not sar_15m[-1][1]):
                 with _filter_lock: _filter_counts["f10_sar"] = _filter_counts.get("f10_sar", 0) + 1
                 return None
+
+        # ── F11 — Volume spike filter (15m last candle vs lookback avg) ───────
+        # The last complete 15m candle must have volume >= mult × avg(lookback candles)
+        if cfg.get("use_vol_spike", False):
+            lookback = max(2, int(cfg.get("vol_spike_lookback", 20)))
+            mult     = float(cfg.get("vol_spike_mult", 2.0))
+            vols_15m = [c["volume"] for c in m15]
+            if len(vols_15m) >= lookback + 1:
+                # average of the `lookback` candles immediately before the last one
+                window  = vols_15m[-(lookback + 1):-1]
+                avg_vol = sum(window) / len(window)
+                last_vol = vols_15m[-1]
+                if avg_vol <= 0 or last_vol < mult * avg_vol:
+                    with _filter_lock: _filter_counts["f11_vol"] = _filter_counts.get("f11_vol", 0) + 1
+                    return None
 
         tp  = round(entry * (1 + cfg["tp_pct"] / 100), 6)
         sl  = round(entry * (1 - cfg["sl_pct"] / 100), 6)
@@ -564,7 +613,6 @@ def scan(cfg: dict):
             r = f.result()
             if r and r != "error":
                 results.append(r)
-    # Sort by symbol name for deterministic ordering
     return sorted(results, key=lambda x: x["symbol"]), _filter_counts.get("errors", 0)
 
 def update_open_signals(signals):
@@ -636,9 +684,7 @@ def _ensure_scanner():
         _b._bsc_thread = t
 
 # ─────────────────────────────────────────────────────────────────────────────
-# ─────────────────────────────────────────────────────────────────────────────
 # STREAMLIT UI
-# ─────────────────────────────────────────────────────────────────────────────
 # ─────────────────────────────────────────────────────────────────────────────
 st.set_page_config(
     page_title="OKX Futures Scanner",
@@ -647,12 +693,11 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-# Start background scanner (safe to call on every rerun — checks is_alive())
 _ensure_scanner()
 
 # ── Snapshot shared state for this render ────────────────────────────────────
 with _log_lock:
-    _snap_log = json.loads(json.dumps(_b._bsc_log))   # deep copy
+    _snap_log = json.loads(json.dumps(_b._bsc_log))
 with _config_lock:
     _snap_cfg = dict(_b._bsc_cfg)
 
@@ -710,35 +755,125 @@ with st.sidebar:
 
     st.divider()
 
-    # ── EMA Filter ────────────────────────────────────────────────────────────
-    st.markdown("**📉 F8 — EMA Filter (5m & 15m)**")
-    new_use_ema200 = st.checkbox(
-        "Enable EMA filter",
-        value=bool(_snap_cfg.get("use_ema200", True)),
-        key="cfg_use_ema200",
-        help="Price must be above the selected EMA on both 5m and 15m charts.",
+    # ── EMA Filter — per timeframe ────────────────────────────────────────────
+    st.markdown("**📉 F8 — EMA Filter** (price above EMA per timeframe)")
+
+    # 3m EMA
+    ea1, ea2 = st.columns([1, 2])
+    new_use_ema_3m = ea1.checkbox(
+        "3m EMA",
+        value=bool(_snap_cfg.get("use_ema_3m", False)),
+        key="cfg_use_ema_3m",
+        help="Price must be above EMA on the 3-minute chart.",
     )
-    new_ema_period = st.number_input(
-        "EMA period",
-        min_value=2,
-        max_value=500,
-        step=1,
-        value=int(_snap_cfg.get("ema_period", 200)),
-        key="cfg_ema_period",
-        disabled=not new_use_ema200,
-        help="Set any EMA period (e.g. 50, 100, 200). Default: 200.",
+    new_ema_period_3m = ea2.number_input(
+        "Period##3m", min_value=2, max_value=500, step=1,
+        value=int(_snap_cfg.get("ema_period_3m", 200)),
+        key="cfg_ema_period_3m",
+        disabled=not new_use_ema_3m,
+        label_visibility="collapsed",
     )
+    if new_use_ema_3m:
+        ea2.caption(f"3m EMA {new_ema_period_3m}")
+
+    # 5m EMA
+    eb1, eb2 = st.columns([1, 2])
+    new_use_ema_5m = eb1.checkbox(
+        "5m EMA",
+        value=bool(_snap_cfg.get("use_ema_5m", True)),
+        key="cfg_use_ema_5m",
+        help="Price must be above EMA on the 5-minute chart.",
+    )
+    new_ema_period_5m = eb2.number_input(
+        "Period##5m", min_value=2, max_value=500, step=1,
+        value=int(_snap_cfg.get("ema_period_5m", 200)),
+        key="cfg_ema_period_5m",
+        disabled=not new_use_ema_5m,
+        label_visibility="collapsed",
+    )
+    if new_use_ema_5m:
+        eb2.caption(f"5m EMA {new_ema_period_5m}")
+
+    # 15m EMA
+    ec1, ec2 = st.columns([1, 2])
+    new_use_ema_15m = ec1.checkbox(
+        "15m EMA",
+        value=bool(_snap_cfg.get("use_ema_15m", True)),
+        key="cfg_use_ema_15m",
+        help="Price must be above EMA on the 15-minute chart.",
+    )
+    new_ema_period_15m = ec2.number_input(
+        "Period##15m", min_value=2, max_value=500, step=1,
+        value=int(_snap_cfg.get("ema_period_15m", 200)),
+        key="cfg_ema_period_15m",
+        disabled=not new_use_ema_15m,
+        label_visibility="collapsed",
+    )
+    if new_use_ema_15m:
+        ec2.caption(f"15m EMA {new_ema_period_15m}")
+
+    st.divider()
+
+    # ── MACD Filter ───────────────────────────────────────────────────────────
+    st.markdown("**📊 F9 — MACD Filter** (3m, 5m & 15m)")
+    new_use_macd = st.checkbox(
+        "Enable MACD filter",
+        value=bool(_snap_cfg.get("use_macd", True)),
+        key="cfg_use_macd",
+        help=(
+            "All 4 conditions must be true on each of 3m, 5m & 15m:\n"
+            "① MACD line > 0  ② Signal line > 0  "
+            "③ Histogram > 0  ④ Bullish crossover within last 12 candles"
+        ),
+    )
+    if new_use_macd:
+        st.caption("✅ MACD line > 0 · Signal > 0 · Histogram > 0 · Crossover ↑")
 
     st.divider()
 
     # ── Parabolic SAR Filter ──────────────────────────────────────────────────
-    st.markdown("**🪂 F10 — Parabolic SAR (5m & 15m)**")
+    st.markdown("**🪂 F10 — Parabolic SAR** (3m, 5m & 15m)")
     new_use_sar = st.checkbox(
         "Enable Parabolic SAR filter",
         value=bool(_snap_cfg.get("use_sar", True)),
         key="cfg_use_sar",
-        help="SAR must signal a bullish trend (SAR below price) on both 5m and 15m.",
+        help="SAR must be below price (bullish trend) on the 3m, 5m AND 15m charts.",
     )
+    if new_use_sar:
+        st.caption("✅ SAR below price on 3m · 5m · 15m")
+
+    st.divider()
+
+    # ── Volume Spike Filter ───────────────────────────────────────────────────
+    st.markdown("**📦 F11 — Volume Spike** (15m)")
+    new_use_vol_spike = st.checkbox(
+        "Enable volume spike filter",
+        value=bool(_snap_cfg.get("use_vol_spike", False)),
+        key="cfg_use_vol_spike",
+        help=(
+            "Last complete 15m candle volume must be ≥ X × the average volume "
+            "of the previous N candles."
+        ),
+    )
+    vx1, vx2 = st.columns(2)
+    new_vol_mult = vx1.number_input(
+        "Multiplier (X×)",
+        min_value=1.0, max_value=20.0, step=0.5,
+        value=float(_snap_cfg.get("vol_spike_mult", 2.0)),
+        key="cfg_vol_mult",
+        disabled=not new_use_vol_spike,
+        help="e.g. 2.0 = last candle must have 2× the average volume.",
+    )
+    new_vol_lookback = vx2.number_input(
+        "Lookback (N candles)",
+        min_value=2, max_value=100, step=1,
+        value=int(_snap_cfg.get("vol_spike_lookback", 20)),
+        key="cfg_vol_lookback",
+        disabled=not new_use_vol_spike,
+        help="Number of prior 15m candles used to compute the average volume.",
+    )
+    if new_use_vol_spike:
+        st.caption(f"✅ Last 15m candle volume ≥ {new_vol_mult}× avg of last {new_vol_lookback} candles")
 
     st.divider()
 
@@ -836,9 +971,21 @@ with st.sidebar:
             "rsi_1h_max":         int(new_rsi1h_max),
             "loop_minutes":       int(new_loop),
             "cooldown_minutes":   int(new_cool),
-            "use_ema200":         bool(new_use_ema200),
-            "ema_period":         int(new_ema_period),
+            # EMA per timeframe
+            "use_ema_3m":         bool(new_use_ema_3m),
+            "ema_period_3m":      int(new_ema_period_3m),
+            "use_ema_5m":         bool(new_use_ema_5m),
+            "ema_period_5m":      int(new_ema_period_5m),
+            "use_ema_15m":        bool(new_use_ema_15m),
+            "ema_period_15m":     int(new_ema_period_15m),
+            # MACD
+            "use_macd":           bool(new_use_macd),
+            # SAR
             "use_sar":            bool(new_use_sar),
+            # Volume spike
+            "use_vol_spike":      bool(new_use_vol_spike),
+            "vol_spike_mult":     float(new_vol_mult),
+            "vol_spike_lookback": int(new_vol_lookback),
             "watchlist":          new_wl,
         }
         with _config_lock:
@@ -885,6 +1032,23 @@ m6.metric("SL Hit",          sl_count)
 # ── Last scanner error (if any) ───────────────────────────────────────────────
 if getattr(_b, "_bsc_last_error", ""):
     st.warning(f"⚠️ Last scanner error: {_b._bsc_last_error}")
+
+st.divider()
+
+# ── Active filters badge row ──────────────────────────────────────────────────
+st.markdown("**Active Filters:**")
+badges = []
+if _snap_cfg.get("use_ema_3m"):    badges.append(f"📉 EMA{_snap_cfg.get('ema_period_3m',200)} 3m")
+if _snap_cfg.get("use_ema_5m"):    badges.append(f"📉 EMA{_snap_cfg.get('ema_period_5m',200)} 5m")
+if _snap_cfg.get("use_ema_15m"):   badges.append(f"📉 EMA{_snap_cfg.get('ema_period_15m',200)} 15m")
+if _snap_cfg.get("use_macd"):      badges.append("📊 MACD 3m·5m·15m")
+if _snap_cfg.get("use_sar"):       badges.append("🪂 SAR 3m·5m·15m")
+if _snap_cfg.get("use_vol_spike"): badges.append(
+    f"📦 Vol ≥{_snap_cfg.get('vol_spike_mult',2.0)}× / {_snap_cfg.get('vol_spike_lookback',20)} 15m candles")
+if badges:
+    st.caption("  |  ".join(badges))
+else:
+    st.caption("No advanced filters enabled")
 
 st.divider()
 
@@ -1025,9 +1189,10 @@ if fc.get("checked", 0) > 0:
         f5  = fc.get("f5_res5m",  0)
         f6  = fc.get("f6_res15m", 0)
         f7  = fc.get("f7_rsi1h",  0)
-        f8  = fc.get("f8_ema200", 0)
+        f8  = fc.get("f8_ema",    0)
         f9  = fc.get("f9_macd",   0)
         f10 = fc.get("f10_sar",   0)
+        f11 = fc.get("f11_vol",   0)
 
         after_f4  = checked   - f4
         after_f5  = after_f4  - f5
@@ -1035,11 +1200,22 @@ if fc.get("checked", 0) > 0:
         after_f7  = after_f6  - f7
         after_f8  = after_f7  - f8
         after_f9  = after_f8  - f9
+        after_f10 = after_f9  - f10
 
-        ema_lbl = f"After F8 EMA {_snap_cfg.get('ema_period', 200)}" + \
-                  ("" if _snap_cfg.get("use_ema200", True) else " (off)")
-        sar_lbl = "Passed F10 SAR" + \
-                  ("" if _snap_cfg.get("use_sar", True) else " (off)")
+        # Build labels to reflect which filters are active
+        ema_parts = []
+        if _snap_cfg.get("use_ema_3m"):  ema_parts.append(f"3m EMA{_snap_cfg.get('ema_period_3m',200)}")
+        if _snap_cfg.get("use_ema_5m"):  ema_parts.append(f"5m EMA{_snap_cfg.get('ema_period_5m',200)}")
+        if _snap_cfg.get("use_ema_15m"): ema_parts.append(f"15m EMA{_snap_cfg.get('ema_period_15m',200)}")
+        ema_lbl = ("After F8 EMA (" + " · ".join(ema_parts) + ")") if ema_parts else "F8 EMA (off)"
+
+        macd_lbl = "After F9 MACD 3m·5m·15m" if _snap_cfg.get("use_macd") else "F9 MACD (off)"
+        sar_lbl  = "After F10 SAR 3m·5m·15m"  if _snap_cfg.get("use_sar")  else "F10 SAR (off)"
+        vol_lbl  = (
+            f"After F11 Vol ≥{_snap_cfg.get('vol_spike_mult',2.0)}× "
+            f"/ {_snap_cfg.get('vol_spike_lookback',20)} 15m"
+            if _snap_cfg.get("use_vol_spike") else "F11 Vol Spike (off)"
+        )
 
         funnel_data = [
             ("Checked",           checked),
@@ -1048,15 +1224,16 @@ if fc.get("checked", 0) > 0:
             ("After F6 15m Res.", after_f6),
             ("After F7 1h RSI",   after_f7),
             (ema_lbl,             after_f8),
-            ("After F9 MACD",     after_f9),
-            (sar_lbl,             fc.get("passed", 0)),
+            (macd_lbl,            after_f9),
+            (sar_lbl,             after_f10),
+            (vol_lbl,             fc.get("passed", 0)),
         ]
         fig_funnel = go.Figure(go.Funnel(
             y=[d[0] for d in funnel_data],
             x=[d[1] for d in funnel_data],
             marker=dict(color=[
                 "#58a6ff","#79c0ff","#a5d6ff",
-                "#3fb950","#56d364","#d29922","#e3b341","#f85149",
+                "#3fb950","#56d364","#d29922","#e3b341","#f0883e","#f85149",
             ]),
             textinfo="value+percent initial",
         ))
@@ -1065,7 +1242,7 @@ if fc.get("checked", 0) > 0:
             plot_bgcolor="rgba(0,0,0,0)",
             font=dict(color="#e6edf3"),
             margin=dict(t=10, b=10, l=10, r=10),
-            height=400,
+            height=450,
         )
         st.plotly_chart(fig_funnel, use_container_width=True)
         st.caption(f"Errors this cycle: {fc.get('errors', 0)}")
